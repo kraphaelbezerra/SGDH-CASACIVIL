@@ -1,0 +1,565 @@
+import os
+import re
+import sys
+from flask import Blueprint, request, jsonify
+
+from flask_login import login_required, current_user
+
+# Adicionar o diretório raiz ao path para importar o dhcp_parser
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+from dhcp_parser import parse_dhcp_conf, get_used_ips, parse_ip_ranges
+from src.utils.audit import log_host_create, log_host_update, log_host_delete, log_action
+
+dhcp_bp = Blueprint('dhcp', __name__)
+
+# Caminhos dos arquivos de configuração
+DHCP_CONF_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'dhcpd.conf')
+IPS_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ips_disponiveis.sh')
+
+def ip_to_int(ip_address):
+    """Converte um endereço IP para inteiro."""
+    parts = list(map(int, ip_address.split('.')))
+    return (parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3]
+
+def int_to_ip(ip_int):
+    """Converte um inteiro para endereço IP."""
+    return f"{(ip_int >> 24) & 0xFF}.{(ip_int >> 16) & 0xFF}.{(ip_int >> 8) & 0xFF}.{ip_int & 0xFF}"
+
+def get_ips_in_range(start_ip, end_ip, used_ips, limit=50):
+    """Retorna uma lista de IPs disponíveis em um range."""
+    available = []
+    start_int = ip_to_int(start_ip)
+    end_int = ip_to_int(end_ip)
+    
+    for ip_int in range(start_int, end_int + 1):
+        if len(available) >= limit:
+            break
+        current_ip = int_to_ip(ip_int)
+        if current_ip not in used_ips:
+            available.append(current_ip)
+    
+    return available
+
+def validate_mac(mac_address):
+    """Valida o formato do endereço MAC."""
+    return re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac_address)
+
+
+
+def find_rule_for_ip(ip_address, rules):
+    """Encontra a regra de IP para um determinado endereço IP."""
+    for rule in rules:
+        start_int = ip_to_int(rule['inicio'])
+        end_int = ip_to_int(rule['fim'])
+        ip_int = ip_to_int(ip_address)
+        if start_int <= ip_int <= end_int:
+            return f"{rule['categoria']} - {rule['acesso']}"
+    return "N/A"
+
+def validate_ip(ip_address):
+    """Valida o formato do endereço IP."""
+    if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", ip_address):
+        return False
+    return all(0 <= int(x) <= 255 for x in ip_address.split('.'))
+
+@dhcp_bp.route('/stats', methods=['GET'])
+@login_required
+def get_stats():
+    """Retorna estatísticas do sistema DHCP."""
+    try:
+        hosts_data = parse_dhcp_conf(DHCP_CONF_PATH)
+        ip_rules = parse_ip_ranges(IPS_SCRIPT_PATH)
+        
+        return jsonify({
+            'total_hosts': len(hosts_data),
+            'total_rules': len(ip_rules),
+            'success': True
+        })
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao obter estatísticas: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/rules', methods=['GET'])
+@login_required
+def get_rules():
+    """Retorna todas as regras de IP disponíveis."""
+    try:
+        ip_rules = parse_ip_ranges(IPS_SCRIPT_PATH)
+        return jsonify(ip_rules)
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao carregar regras: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/available-ips', methods=['GET'])
+@login_required
+def get_available_ips():
+    """Retorna IPs disponíveis em um range específico."""
+    try:
+        start_ip = request.args.get('start')
+        end_ip = request.args.get('end')
+        
+        if not start_ip or not end_ip:
+            return jsonify({
+                'message': 'Parâmetros start e end são obrigatórios',
+                'success': False
+            }), 400
+        
+        if not validate_ip(start_ip) or not validate_ip(end_ip):
+            return jsonify({
+                'message': 'Endereços IP inválidos',
+                'success': False
+            }), 400
+        
+        used_ips = get_used_ips(DHCP_CONF_PATH)
+        available_ips = get_ips_in_range(start_ip, end_ip, used_ips)
+        
+        return jsonify(available_ips)
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao obter IPs disponíveis: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/hosts_status', methods=['GET'])
+@login_required
+def get_hosts_status():
+    """Retorna todos os hosts cadastrados com o status de conectividade e a regra de IP."""
+    try:
+        hosts_data = parse_dhcp_conf(DHCP_CONF_PATH)
+        ip_rules = parse_ip_ranges(IPS_SCRIPT_PATH)
+        hosts_with_status = []
+        for host in hosts_data:
+            host['connectivity_status'] = "Cadastrado no DHCP"
+            host['rule'] = find_rule_for_ip(host['ip_address'], ip_rules)
+            hosts_with_status.append(host)
+        
+        return jsonify(hosts_with_status)
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao carregar hosts com status: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/hosts', methods=['GET'])
+@login_required
+def get_hosts():
+    """Retorna todos os hosts cadastrados."""
+    try:
+        hosts_data = parse_dhcp_conf(DHCP_CONF_PATH)
+        return jsonify(hosts_data)
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao carregar hosts: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/register', methods=['POST'])
+@login_required
+def register_ip():
+    """Registra um novo IP no sistema DHCP."""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'message': 'Dados JSON são obrigatórios',
+                'success': False
+            }), 400
+        
+        host_name = data.get('host_name', '').strip()
+        mac_address = data.get('mac_address', '').strip().upper()
+        ip_address = data.get('ip_address', '').strip()
+        
+        # Validações
+        if not all([host_name, mac_address, ip_address]):
+            return jsonify({
+                'message': 'Todos os campos são obrigatórios',
+                'success': False
+            }), 400
+        
+        if not validate_mac(mac_address):
+            return jsonify({
+                'message': 'Endereço MAC inválido. Use o formato XX:XX:XX:XX:XX:XX',
+                'success': False
+            }), 400
+        
+        if not validate_ip(ip_address):
+            return jsonify({
+                'message': 'Endereço IP inválido',
+                'success': False
+            }), 400
+        
+        # Verificar se o IP já está em uso
+        used_ips = get_used_ips(DHCP_CONF_PATH)
+        if ip_address in used_ips:
+            return jsonify({
+                'message': f'O IP {ip_address} já está em uso',
+                'success': False
+            }), 400
+        
+        # Verificar se o IP está dentro de alguma regra
+        ip_rules = parse_ip_ranges(IPS_SCRIPT_PATH)
+        is_ip_in_rule = False
+        for rule in ip_rules:
+            start_int = ip_to_int(rule["inicio"])
+            end_int = ip_to_int(rule["fim"])
+            ip_int = ip_to_int(ip_address)
+            if start_int <= ip_int <= end_int:
+                is_ip_in_rule = True
+                break
+        
+        if not is_ip_in_rule:
+            return jsonify({
+                'message': f'O IP {ip_address} não pertence a nenhum range de regras definido',
+                'success': False
+            }), 400
+        
+        # Verificar se o nome do host já existe
+        hosts_data = parse_dhcp_conf(DHCP_CONF_PATH)
+        existing_names = [host['name'] for host in hosts_data]
+        if host_name.replace(' ', '_') in existing_names:
+            return jsonify({
+                'message': f'O nome do host {host_name} já existe',
+                'success': False
+            }), 400
+        
+        # Verificar se o MAC já existe
+        existing_macs = [host['mac_address'] for host in hosts_data]
+        if mac_address in existing_macs:
+            return jsonify({
+                'message': f'O endereço MAC {mac_address} já está cadastrado',
+                'success': False
+            }), 400
+        
+        # Criar entrada para o dhcpd.conf
+        from datetime import datetime
+        registration_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        host_name_clean = host_name.replace(' ', '_').replace('-', '_')
+        new_host_entry = f'''
+          host {host_name_clean} {{
+                  hardware ethernet {mac_address};
+	          fixed-address {ip_address};
+	          }}
+	          # Data: {registration_date}'''
+        
+        # Adicionar ao arquivo dhcpd.conf
+        with open(DHCP_CONF_PATH, 'a', encoding='utf-8') as f:
+            f.write(new_host_entry)
+        
+        # Registrar log de auditoria
+        rule_name = find_rule_for_ip(ip_address, ip_rules)
+        log_host_create(host_name_clean, mac_address, ip_address, rule_name)
+        
+        return jsonify({
+            'message': f'Host {host_name} registrado com sucesso!',
+            'success': True,
+            'data': {
+                'host_name': host_name,
+                'mac_address': mac_address,
+                'ip_address': ip_address
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro interno do servidor: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/hosts/<string:host_name>', methods=['DELETE'])
+@login_required
+def delete_host(host_name):
+    """Exclui um host do arquivo dhcpd.conf."""
+    try:
+        # Obter dados do host antes de excluir para o log
+        hosts_data = parse_dhcp_conf(DHCP_CONF_PATH)
+        host_to_delete = None
+        for host in hosts_data:
+            if host['name'] == host_name:
+                host_to_delete = host
+                break
+        
+        with open(DHCP_CONF_PATH, 'r') as f:
+            lines = f.readlines()
+
+        new_lines = []
+        in_host_block = False
+        host_found = False
+        # Itera pelas linhas e recria o arquivo sem o bloco do host a ser excluído
+        for i, line in enumerate(lines):
+            # Detecta o início do bloco do host
+            if re.search(r'host\s+' + re.escape(host_name) + r'\s*\{', line):
+                in_host_block = True
+                host_found = True
+                # Pula a linha de comentário de data, se existir
+                if i + 3 < len(lines) and '# Data:' in lines[i+3]:
+                    del lines[i+3]
+                continue
+
+            # Detecta o fim do bloco do host
+            if in_host_block and '}' in line:
+                in_host_block = False
+                continue
+
+            if not in_host_block:
+                new_lines.append(line)
+
+        if not host_found:
+            return jsonify({'message': 'Host não encontrado', 'success': False}), 404
+
+        # Cria um backup antes de sobrescrever
+        with open(DHCP_CONF_PATH + '.bak', 'w') as backup_file:
+            backup_file.writelines(lines)
+
+        with open(DHCP_CONF_PATH, 'w') as f:
+            f.writelines(new_lines)
+        
+        # Registrar log de auditoria
+        if host_to_delete:
+            log_host_delete(host_name, host_to_delete['mac_address'], host_to_delete['ip_address'])
+
+        return jsonify({'message': f'Host {host_name} excluído com sucesso!', 'success': True})
+
+    except Exception as e:
+        return jsonify({'message': f'Erro ao excluir host: {str(e)}', 'success': False}), 500
+
+@dhcp_bp.route('/validate-ip', methods=['POST'])
+@login_required
+def validate_ip_endpoint():
+    """Valida se um IP está disponível e dentro das regras."""
+    try:
+        data = request.get_json()
+        ip_address = data.get('ip_address', '').strip()
+        
+        if not ip_address:
+            return jsonify({
+                'message': 'Endereço IP é obrigatório',
+                'success': False
+            }), 400
+        
+        if not validate_ip(ip_address):
+            return jsonify({
+                'message': 'Endereço IP inválido',
+                'success': False,
+                'valid': False
+            }), 400
+        
+        # Verificar se está em uso
+        used_ips = get_used_ips(DHCP_CONF_PATH)
+        if ip_address in used_ips:
+            return jsonify({
+                'message': 'IP já está em uso',
+                'success': True,
+                'valid': False,
+                'in_use': True
+            })
+        
+        # Verificar se está em alguma regra
+        ip_rules = parse_ip_ranges(IPS_SCRIPT_PATH)
+        matching_rule = None
+        for rule in ip_rules:
+            start_int = ip_to_int(rule["inicio"])
+            end_int = ip_to_int(rule["fim"])
+            ip_int = ip_to_int(ip_address)
+            if start_int <= ip_int <= end_int:
+                matching_rule = rule
+                break
+        
+        if not matching_rule:
+            return jsonify({
+                'message': 'IP não pertence a nenhum range de regras',
+                'success': True,
+                'valid': False,
+                'in_rule': False
+            })
+        
+        return jsonify({
+            'message': 'IP válido e disponível',
+            'success': True,
+            'valid': True,
+            'in_use': False,
+            'in_rule': True,
+            'rule': matching_rule
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao validar IP: {str(e)}',
+            'success': False
+        }), 500
+
+@dhcp_bp.route('/hosts/<string:host_name>', methods=['PUT'])
+@login_required
+def update_host(host_name):
+    """Atualiza um host existente no arquivo dhcpd.conf."""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'message': 'Dados JSON são obrigatórios',
+                'success': False
+            }), 400
+        
+        new_mac_address = data.get('mac_address', '').strip().upper()
+        new_ip_address = data.get('ip_address', '').strip()
+        
+        # Validações básicas
+        if not all([new_mac_address, new_ip_address]):
+            return jsonify({
+                'message': 'MAC e IP são obrigatórios',
+                'success': False
+            }), 400
+        
+        if not validate_mac(new_mac_address):
+            return jsonify({
+                'message': 'Endereço MAC inválido. Use o formato XX:XX:XX:XX:XX:XX',
+                'success': False
+            }), 400
+        
+        if not validate_ip(new_ip_address):
+            return jsonify({
+                'message': 'Endereço IP inválido',
+                'success': False
+            }), 400
+        
+        # Obter dados atuais do host
+        hosts_data = parse_dhcp_conf(DHCP_CONF_PATH)
+        current_host = None
+        for host in hosts_data:
+            if host['name'] == host_name:
+                current_host = host
+                break
+        
+        if not current_host:
+            return jsonify({
+                'message': f'Host {host_name} não encontrado',
+                'success': False
+            }), 404
+        
+        # Verificar se o novo IP está em uso (exceto se for o mesmo IP atual)
+        if new_ip_address != current_host['ip_address']:
+            used_ips = get_used_ips(DHCP_CONF_PATH)
+            if new_ip_address in used_ips:
+                return jsonify({
+                    'message': f'O IP {new_ip_address} já está em uso',
+                    'success': False
+                }), 400
+            
+            # Verificar se o novo IP está dentro de alguma regra
+            ip_rules = parse_ip_ranges(IPS_SCRIPT_PATH)
+            is_ip_in_rule = False
+            for rule in ip_rules:
+                start_int = ip_to_int(rule["inicio"])
+                end_int = ip_to_int(rule["fim"])
+                ip_int = ip_to_int(new_ip_address)
+                if start_int <= ip_int <= end_int:
+                    is_ip_in_rule = True
+                    break
+            
+            if not is_ip_in_rule:
+                return jsonify({
+                    'message': f'O IP {new_ip_address} não pertence a nenhum range de regras definido',
+                    'success': False
+                }), 400
+        
+        # Verificar se o novo MAC já existe (exceto se for o mesmo MAC atual)
+        if new_mac_address != current_host['mac_address']:
+            existing_macs = [host['mac_address'] for host in hosts_data if host['name'] != host_name]
+            if new_mac_address in existing_macs:
+                return jsonify({
+                    'message': f'O endereço MAC {new_mac_address} já está cadastrado',
+                    'success': False
+                }), 400
+        
+        # Ler o arquivo e atualizar o host
+        with open(DHCP_CONF_PATH, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        new_lines = []
+        in_host_block = False
+        host_found = False
+        
+        for i, line in enumerate(lines):
+            # Detecta o início do bloco do host
+            if re.search(r'host\s+' + re.escape(host_name) + r'\s*\{', line):
+                in_host_block = True
+                host_found = True
+                # Adiciona o cabeçalho do host
+                new_lines.append(line)
+                continue
+            
+            # Se estiver dentro do bloco do host, atualizar os valores
+            if in_host_block:
+                if 'hardware ethernet' in line:
+                    # Atualizar MAC
+                    indent = len(line) - len(line.lstrip())
+                    new_lines.append(' ' * indent + f'hardware ethernet {new_mac_address};\n')
+                    continue
+                elif 'fixed-address' in line:
+                    # Atualizar IP
+                    indent = len(line) - len(line.lstrip())
+                    new_lines.append(' ' * indent + f'fixed-address {new_ip_address};\n')
+                    continue
+                elif '}' in line:
+                    # Fim do bloco
+                    in_host_block = False
+                    new_lines.append(line)
+                    # Atualizar comentário de data se existir
+                    if i + 1 < len(lines) and '# Data:' in lines[i + 1]:
+                        from datetime import datetime
+                        update_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        new_lines.append(f'          # Data: {update_date} (Atualizado)\n')
+                        continue
+                    continue
+                else:
+                    new_lines.append(line)
+                    continue
+            
+            new_lines.append(line)
+        
+        if not host_found:
+            return jsonify({
+                'message': f'Host {host_name} não encontrado no arquivo',
+                'success': False
+            }), 404
+        
+        # Criar backup antes de sobrescrever
+        with open(DHCP_CONF_PATH + '.bak', 'w', encoding='utf-8') as backup_file:
+            backup_file.writelines(lines)
+        
+        # Escrever o arquivo atualizado
+        with open(DHCP_CONF_PATH, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        
+        # Registrar log de auditoria
+        old_data = {
+            'mac_address': current_host['mac_address'],
+            'ip_address': current_host['ip_address']
+        }
+        new_data = {
+            'mac_address': new_mac_address,
+            'ip_address': new_ip_address
+        }
+        log_host_update(host_name, old_data, new_data)
+        
+        return jsonify({
+            'message': f'Host {host_name} atualizado com sucesso!',
+            'success': True,
+            'data': {
+                'host_name': host_name,
+                'mac_address': new_mac_address,
+                'ip_address': new_ip_address
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'message': f'Erro ao atualizar host: {str(e)}',
+            'success': False
+        }), 500
